@@ -17,19 +17,32 @@ const createCheckoutSession = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'eventId, tierName, and quantity are required.' });
     }
 
-    const event = await Event.findById(eventId);
-    if (!event || event.status !== 'published') {
-      return res.status(404).json({ success: false, message: 'Event not found or not available.' });
+    // Atomically decrement remaining inventory using findOneAndUpdate with a quantity guard!
+    const event = await Event.findOneAndUpdate(
+      {
+        _id: eventId,
+        status: 'published',
+        ticketTiers: {
+          $elemMatch: {
+            name: tierName,
+            remaining: { $gte: quantity },
+          },
+        },
+      },
+      {
+        $inc: { 'ticketTiers.$.remaining': -quantity },
+      },
+      { new: true }
+    );
+
+    if (!event) {
+      return res.status(400).json({
+        success: false,
+        message: 'Selected ticket tier is sold out, has insufficient capacity, or event is unavailable.',
+      });
     }
 
     const tier = event.ticketTiers.find((t) => t.name === tierName);
-    if (!tier) {
-      return res.status(400).json({ success: false, message: 'Ticket tier not found.' });
-    }
-
-    if (tier.remaining < quantity) {
-      return res.status(400).json({ success: false, message: `Only ${tier.remaining} tickets remaining for this tier.` });
-    }
 
     const totalAmount = tier.price * quantity;
 
@@ -131,13 +144,9 @@ const fulfillBooking = async (session) => {
   booking.status = 'paid';
   booking.stripePaymentIntentId = session.payment_intent;
 
-  // Atomically reduce seat count
+  // Inventory was already atomically decremented (provisionally held) at checkout initiation.
   const event = await Event.findById(eventId);
-  const tier = event.ticketTiers.find((t) => t.name === tierName);
-  if (tier) {
-    tier.remaining = Math.max(0, tier.remaining - Number(quantity));
-  }
-  await event.save();
+  if (!event) return;
 
   // Generate tickets
   const ticketDocs = [];
@@ -185,4 +194,23 @@ const fulfillBooking = async (session) => {
   }
 };
 
-module.exports = { createCheckoutSession, getMyBookings, getBookingById, fulfillBooking };
+// Internal function called by Stripe webhook when a session expires or payment fails
+const releaseBookingInventory = async (session) => {
+  const { bookingId, eventId, tierName, quantity } = session.metadata || {};
+  if (!bookingId || !eventId || !tierName || !quantity) return;
+
+  const booking = await Booking.findById(bookingId);
+  if (!booking || booking.status !== 'pending') return; // Only release if still pending!
+
+  booking.status = 'failed';
+  await booking.save();
+
+  // Atomically restore the provisionally held inventory back to availability
+  await Event.findOneAndUpdate(
+    { _id: eventId, 'ticketTiers.name': tierName },
+    { $inc: { 'ticketTiers.$.remaining': Number(quantity) } }
+  );
+  console.log(`♻️ Released ${quantity} provisionally-held seats for [${tierName}] back to inventory.`);
+};
+
+module.exports = { createCheckoutSession, getMyBookings, getBookingById, fulfillBooking, releaseBookingInventory };

@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { useAuth } from '@/context/AuthContext';
 import { useState } from 'react';
-import { Menu, X, Ticket, ChevronDown, LogOut, User, LayoutDashboard, QrCode, Calendar } from 'lucide-react';
+import { Menu, X, Ticket, ChevronDown, LogOut, QrCode, Calendar } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import toast from 'react-hot-toast';
 

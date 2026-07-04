@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-const { fulfillBooking } = require('../controllers/bookingController');
+const { fulfillBooking, releaseBookingInventory } = require('../controllers/bookingController');
 
 // NOTE: This route must receive the raw body (not parsed JSON)
 // This is handled in app.js before the global express.json() middleware
@@ -33,10 +33,27 @@ router.post('/', async (req, res) => {
       }
       break;
     }
+    case 'checkout.session.expired':
+    case 'checkout.session.async_payment_failed': {
+      const session = event.data.object;
+      console.log('⚠️ Session expired or failed:', session.id);
+      try {
+        await releaseBookingInventory(session);
+      } catch (err) {
+        console.error('❌ Release inventory error:', err.message);
+      }
+      break;
+    }
     case 'payment_intent.payment_failed': {
       const pi = event.data.object;
       console.log('❌ Payment failed:', pi.id);
-      // Optionally mark booking as failed
+      try {
+        if (pi.metadata && pi.metadata.bookingId) {
+          await releaseBookingInventory(pi);
+        }
+      } catch (err) {
+        console.error('❌ Release inventory error:', err.message);
+      }
       break;
     }
     default:

@@ -20,13 +20,14 @@
 4. [Workflow Diagrams](#-workflow-diagrams)
    - [Event Booking & Payment Pipeline](#1-event-booking--payment-pipeline)
    - [QR Ticket Verification & Check-in Flow](#2-qr-ticket-verification--check-in-flow)
-5. [Technology Stack](#-technology-stack)
-6. [Database Schema & Data Models](#-database-schema--data-models)
-7. [REST API Documentation](#-rest-api-documentation)
-8. [Quick Start & Setup Guide](#-quick-start--setup-guide)
-9. [Stripe Webhook Configuration](#-stripe-webhook-configuration)
-10. [Test Accounts & Sandbox Cards](#-test-accounts--sandbox-cards)
-11. [Project Directory Structure](#-project-directory-structure)
+5. [Architectural Safeguards](#-architectural-safeguards--overselling--duplicate-check-in-prevention)
+6. [Technology Stack](#-technology-stack)
+7. [Database Schema & Data Models](#-database-schema--data-models)
+8. [REST API Documentation](#-rest-api-documentation)
+9. [Quick Start & Setup Guide](#-quick-start--setup-guide)
+10. [Stripe Webhook Configuration](#-stripe-webhook-configuration)
+11. [Test Accounts & Sandbox Cards](#-test-accounts--sandbox-cards)
+12. [Project Directory Structure](#-project-directory-structure)
 
 ---
 
@@ -187,6 +188,57 @@ sequenceDiagram
     end
     Camera->>Organizer: Display Visual Status Banner (Green Success / Red Error)
 ```
+
+---
+
+## 🛡️ Architectural Safeguards — Overselling & Duplicate Check-in Prevention
+
+EventHive implements robust concurrency and cryptographic controls to guarantee that tickets cannot be oversold during high-traffic checkout surges and that valid tickets cannot be duplicated or reused at venue gates.
+
+### 1. Zero-Overselling Concurrency Guard (Atomic Provisional Holding)
+Traditional e-commerce architectures often suffer from race conditions where two attendees initiate checkout simultaneously for the last remaining seat. If inventory is only decremented when payment succeeds, both users will complete payment, resulting in oversold tickets and severe operational disruption.
+
+**The EventHive Concurrency Solution:**
+- **Atomic Query Guards at Checkout Initiation**: When an attendee clicks "Proceed to Payment", `createCheckoutSession` executes an atomic MongoDB `findOneAndUpdate` query with a strict quantity guard:
+  ```javascript
+  const event = await Event.findOneAndUpdate(
+    {
+      _id: eventId,
+      status: 'published',
+      ticketTiers: { $elemMatch: { name: tierName, remaining: { $gte: quantity } } }
+    },
+    { $inc: { 'ticketTiers.$.remaining': -quantity } },
+    { new: true }
+  );
+  ```
+  This query ensures that MongoDB's document-level locking checks `remaining >= quantity` and decrements `-quantity` in a single atomic transaction. If concurrent purchases occur, MongoDB serializes the modifications; once `remaining` drops below the requested quantity, subsequent queries return `null` and the API immediately rejects the request with a `400 Bad Request` before creating a Stripe session.
+- **Provisional Hold & Automated Release**: Decrementing at checkout initiation acts as a **provisional inventory hold**. If the attendee successfully completes payment, the Stripe webhook (`checkout.session.completed`) marks the booking as `paid` and issues the tickets without further inventory modification.
+- **Expiration & Failure Reconciliation**: If an attendee abandons checkout or card processing fails, our Stripe webhook handler (`checkout.session.expired`, `checkout.session.async_payment_failed`, and `payment_intent.payment_failed`) intercepts the failure and calls `releaseBookingInventory(session)`. This function verifies that the booking status is still `'pending'`, marks it as `'failed'`, and atomically increments (`$inc: +quantity`) the held seats back to availability.
+
+---
+
+### 2. Cryptographic Gate Security (Duplicate Check-in Prevention)
+To prevent ticket fraud, screenshots, or physical photocopy duplication, EventHive decouples QR codes from simple database IDs and enforces strict state locking at venue entrances.
+
+**The EventHive Gate Security Solution:**
+- **Tamper-Proof JWT Payload Signing**: Each ticket QR code encodes a JSON Web Token (JWT) signed with a private server cryptographic key (`QR_SECRET`). The payload embeds `ticketNumber`, `eventId`, `userId`, and issuance timestamp:
+  ```javascript
+  const qrCodeData = jwt.sign({ ticketNumber, eventId, userId, issuedAt }, process.env.QR_SECRET);
+  ```
+  If an attacker attempts to modify a QR code payload (e.g., changing ticket tier or seat ID), the cryptographic signature becomes invalid. When scanned by the organizer's camera, `jwt.verify()` throws an exception and the gate scanner instantly displays a red `400 Bad Request — Invalid or tampered QR code` banner.
+- **Atomic State Verification & Idempotency**: When a valid JWT is scanned, the API queries the ticket document by `ticketNumber`. Before granting entry, it evaluates the boolean state lock:
+  ```javascript
+  if (ticket.checkedIn) {
+    return res.status(409).json({
+      success: false,
+      message: 'Ticket already checked in.',
+      checkedInAt: ticket.checkedInAt,
+      attendee: ticket.user?.name,
+    });
+  }
+  ```
+  If `checkedIn` is already `true`, the API rejects the scan with a `409 Conflict` status code and returns the exact timestamp (`checkedInAt`) and staff member ID (`checkedInBy`) of when entry was originally granted. The organizer's scanner displays an audible and visual warning stating *"Ticket already checked in at [Timestamp]"*.
+- **Instant Gate Execution**: For valid, unentered tickets, the API updates `checkedIn = true` and records the check-in timestamp in real-time, locking out any subsequent scans of that same QR code within milliseconds.
 
 ---
 

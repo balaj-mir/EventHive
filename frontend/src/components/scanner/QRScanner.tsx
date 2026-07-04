@@ -47,8 +47,9 @@ export default function QRScanner() {
             } else {
               toast.error(data.message);
             }
-          } catch (err: any) {
-            const msg = err.response?.data?.message || 'Verification failed.';
+          } catch (err: unknown) {
+            const errorObj = err as { response?: { data?: { message?: string } } };
+            const msg = errorObj.response?.data?.message || 'Verification failed.';
             setResult({ success: false, message: msg });
             toast.error(msg);
           } finally {
@@ -58,7 +59,7 @@ export default function QRScanner() {
         undefined
       );
       setScanning(true);
-    } catch (err) {
+    } catch {
       toast.error('Could not access camera. Please allow camera permissions.');
     }
   };
@@ -90,7 +91,7 @@ export default function QRScanner() {
           QR Check-In Scanner
         </h2>
         <p className="text-gray-400 text-sm mb-6">
-          Point your camera at an attendee's QR ticket to check them in.
+          Point your camera at an attendee&apos;s QR ticket to check them in.
         </p>
 
         {/* Camera view */}
